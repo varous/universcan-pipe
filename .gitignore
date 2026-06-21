@@ -1,0 +1,15 @@
+# data + generated artifacts (never commit these)
+data/
+out/
+*.ply
+*.dxf
+*.skp
+
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pythonlibs/
