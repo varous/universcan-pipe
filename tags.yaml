@@ -1,0 +1,80 @@
+# =====================================================================
+# tags.yaml  —  THE CONTRACT.
+# The Python side (abstract.py) writes faces tagged with these canonical
+# names; the SketchUp side (build_skp.rb) reads them and assigns Tags;
+# every downstream SPL tool keys off the per-tool layer map at the bottom.
+# Change a name here and you change it everywhere — that is the point.
+# =====================================================================
+
+# ---- canonical tag vocabulary --------------------------------------
+# The only tags the rest of the system is allowed to emit. Keep this list
+# small and stable. STRUCTURE is the catch-all for anything unclassified.
+tags:
+  FLOOR:          "Main floor / ground plane"
+  CEILING:        "Ceiling / underside of roof"
+  WALL_LEFT:      "House-left side wall (audience POV)"
+  WALL_RIGHT:     "House-right side wall"
+  WALL_REAR:      "Rear wall (behind audience)"
+  WALL_FRONT:     "Front wall / proscenium plane"
+  AUDIENCE_MAIN:  "Main raked seating / listening plane"
+  AUDIENCE_BALCONY: "Balcony / upper-tier listening plane"
+  STAGE:          "Stage deck / performance surface"
+  BALCONY_FACE:   "Vertical face of a balcony (reflector)"
+  STRUCTURE:      "Unclassified structural surface"
+
+# ---- datum (production) --------------------------------------------
+# In production, re-level to the floor (z=0) and set origin to
+# stage-front-centre so every venue shares one frame. The classifier below
+# falls back to bbox-relative position when use_fixed_datum is false, which
+# is fine for a first pass / demo.
+datum:
+  use_fixed_datum: false
+  floor_z: 0.0
+  origin_xy: [0.0, 0.0]     # stage-front-centre, once you set it per venue
+
+# ---- pipeline parameters (the volatile knobs) ----------------------
+# These are the numbers you will re-tune per venue class. Externalised here
+# on purpose so "maintenance" is editing YAML, not touching code.
+pipeline:
+  voxel_m: 0.05             # downsample leaf size (start from inspector's rec)
+  ransac_dist_m: 0.03       # plane inlier distance threshold
+  ransac_n: 3
+  ransac_iters: 1000
+  min_plane_points: 800     # ignore planes smaller than this (post-voxel)
+  max_planes: 40            # stop after this many (greedy peel)
+  dbscan_eps_m: 0.5         # split coplanar-but-separate patches
+  dbscan_min_points: 50
+  simplify_tol_m: 0.10      # boundary simplification (Douglas-Peucker)
+
+# ---- classification rules ------------------------------------------
+# Applied per plane from its normal + centroid. cos thresholds are on the
+# absolute Z-component of the unit normal.
+classify:
+  vertical_cos: 0.995       # |nz| above this => horizontal (floor/ceiling/stage)
+                            # set high: even a gentle audience rake (~10deg, nz~0.98)
+                            # must fall BELOW this to be caught as sloped seating
+  horizontal_cos: 0.20      # |nz| below this  => vertical surface
+  floor_ceiling_split_frac: 0.5   # of venue height; below=floor, above=ceiling
+  stage:
+    enabled: true
+    min_z_m: 0.4            # stage deck sits above the floor...
+    max_z_m: 1.6            # ...but below seating height
+    front_zone_frac: 0.35   # and within the front fraction of venue depth (Y)
+  balcony_face:
+    min_z_m: 2.0            # vertical surface whose BOTTOM is this high...
+    max_height_m: 2.5       # ...and whose vertical span is short => balcony face
+                            # (full-height walls exceed this and stay WALL_*)
+
+# ---- downstream layer map (the fan-out adapter) --------------------
+# canonical tag -> the layer/tag name each tool expects. ArrayCalc Exchange
+# keys input type off layer-name extensions; fill these from each tool's
+# convention as you wire them up. null = use canonical name as-is.
+downstream_layers:
+  mapp3d:        null                  # MAPP imports skp tags directly
+  arraycalc:                           # ArrayCalc Exchange layer-name extensions
+    AUDIENCE_MAIN:   "Audience_A"
+    AUDIENCE_BALCONY: "Audience_B"
+    STAGE:           "Source_Stage"
+    # walls/floor/ceiling -> structure layers (fill per your Exchange setup)
+  venue_synthesis: null                # JBL VS: assign audience areas via Tags
+  soundvision:     null                # SU4SV: designate audience object

@@ -1,0 +1,15 @@
+run = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+modules = ["python-3.11"]
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+DATA_DIR = "./data"
+MONGO_DB = "scanpipe"
+# Open3D needs system GL libs on the lib path:
+LD_LIBRARY_PATH = "/nix/store/.../lib"   # see runbook; usually auto via replit.nix
+
+[[ports]]
+localPort = 8000
+externalPort = 80

@@ -1,0 +1,29 @@
+# Local all-in-one: API + a local MongoDB, for dev or for running fully offline
+# on the workstation. For production, drop the `mongo` service and point
+# MONGO_URI at Atlas instead.
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongodata:/data/db
+    ports:
+      - "27017:27017"
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: scanpipe
+      DATA_DIR: /data
+    volumes:
+      - scandata:/data          # point clouds, manifests, dxf live here
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+
+volumes:
+  mongodata:
+  scandata:

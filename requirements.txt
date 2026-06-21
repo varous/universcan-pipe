@@ -1,0 +1,18 @@
+# ---- pipeline core (CPU only; no GPU needed) ----
+numpy>=1.24
+plyfile>=1.0          # .ply header/field inspection (inspect_ply.py)
+scipy>=1.10           # cKDTree density estimate
+open3d>=0.18          # RANSAC segment_plane, DBSCAN (abstract.py)
+ezdxf>=1.1            # DXF emit
+pyyaml>=6.0           # read tags.yaml
+shapely>=2.0          # polygon ops / boundary simplify (bounding upgrade path)
+alphashape>=1.3       # concave hulls for irregular surfaces (upgrade path)
+# pye57>=0.4          # uncomment if Green Valley exports .e57 instead of .ply
+
+# ---- API service + database ----
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pymongo>=4.6          # MongoDB driver (sync)
+python-multipart>=0.0.9   # file uploads
+mongomock>=4.1        # tests only
+httpx>=0.27           # TestClient dep
