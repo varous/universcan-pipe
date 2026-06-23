@@ -13,3 +13,15 @@ __pycache__/
 *.pyc
 .venv/
 .pythonlibs/
+
+scanpipe/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+data/
+out/
+*.ply
+*.dxf
+*.skp
