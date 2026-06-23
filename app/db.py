@@ -20,9 +20,12 @@ def init_db(client=None, db_name=None):
     global _db
     if client is None:
         uri = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
-        client = MongoClient(uri)
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
     _db = client[db_name or os.environ.get("MONGO_DB", "scanpipe")]
-    _ensure_indexes(_db)
+    try:
+        _ensure_indexes(_db)
+    except Exception:
+        pass
     return _db
 
 

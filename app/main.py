@@ -30,7 +30,10 @@ app = FastAPI(title="scanpipe", version="0.1.0",
 
 @app.on_event("startup")
 def _startup():
-    db.init_db()
+    try:
+        db.init_db()
+    except Exception as e:
+        print(f"WARNING: Mongo init failed at startup: {e}")
 
 
 @app.get("/health")
