@@ -78,3 +78,12 @@ downstream_layers:
     # walls/floor/ceiling -> structure layers (fill per your Exchange setup)
   venue_synthesis: null                # JBL VS: assign audience areas via Tags
   soundvision:     null                # SU4SV: designate audience object
+
+# ---- Tier-1 splat extraction (3DGS .ply -> geometry centres) --------
+# Applied automatically when a file is detected as a Gaussian splat. The
+# resulting cloud is the LOOSE path — lean on the measurement gate.
+splat:
+  opacity_thresh: 0.5    # keep Gaussians with sigmoid(opacity) above this (drop floaters)
+  scale_pct: 99.0        # drop Gaussians larger than this size-percentile (drop blobs)
+  scale_max_m: null      # absolute size cap in metres; overrides scale_pct if set
+  color_from_sh: true    # recover RGB from the SH DC term for visual QA

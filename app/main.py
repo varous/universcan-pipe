@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app import db
 from app.models import VenueIn, MeasurementIn
-from app.pipeline import inspect_file, abstract_file
+from app.pipeline import inspect_file, abstract_file, is_splat, extract_splat
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "data"))
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
@@ -30,10 +30,7 @@ app = FastAPI(title="scanpipe", version="0.1.0",
 
 @app.on_event("startup")
 def _startup():
-    try:
-        db.init_db()
-    except Exception as e:
-        print(f"WARNING: Mongo init failed at startup: {e}")
+    db.init_db()
 
 
 @app.get("/health")
@@ -54,6 +51,9 @@ def inspect(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, fh)
     try:
         return inspect_file(tmp)
+    except Exception as e:
+        raise HTTPException(422, f"could not read as a point cloud "
+                                 f"(.ply expected; .las/.laz not yet supported): {e}")
     finally:
         os.remove(tmp)
 
@@ -111,7 +111,22 @@ def create_scan(
     out_dir = os.path.join(OUT_DIR, sid)
     try:
         summary = inspect_file(ply_path)
-        manifest = abstract_file(ply_path, out_dir, voxel=voxel)
+    except Exception as e:
+        raise HTTPException(422, f"could not read uploaded file as a point cloud: {e}")
+
+    # --- Tier-1 splat routing: if it's a 3DGS splat, extract centres first ---
+    splat_info = None
+    cloud_for_abstract = ply_path
+    if summary.get("is_gaussian_splat") or is_splat(ply_path):
+        derived = os.path.join(UPLOAD_DIR, f"{sid}_centres.ply")
+        try:
+            splat_info = extract_splat(ply_path, derived)
+        except Exception as e:
+            raise HTTPException(422, f"splat extraction failed: {e}")
+        cloud_for_abstract = derived
+
+    try:
+        manifest = abstract_file(cloud_for_abstract, out_dir, voxel=voxel)
     except Exception as e:
         raise HTTPException(422, f"pipeline failed: {e}")
 
@@ -124,6 +139,8 @@ def create_scan(
         "device": device,
         "operator": operator,
         "source_ply_path": ply_path,
+        "is_splat_derived": splat_info is not None,
+        "splat_extraction": splat_info,        # null for LiDAR; stats for splats
         "units": summary.get("inferred_units"),
         "up_axis": summary.get("inferred_up_axis"),
         "gravity_aligned": summary.get("gravity_aligned_Zup"),
