@@ -43,7 +43,7 @@ pipeline:
   min_plane_points: 800     # ignore planes smaller than this (post-voxel)
   max_planes: 40            # stop after this many (greedy peel)
   dbscan_eps_m: 0.5         # split coplanar-but-separate patches
-  dbscan_min_points: 50
+  dbscan_min_points: 25
   simplify_tol_m: 0.10      # boundary simplification (Douglas-Peucker)
 
 # ---- classification rules ------------------------------------------
@@ -87,3 +87,17 @@ splat:
   scale_pct: 99.0        # drop Gaussians larger than this size-percentile (drop blobs)
   scale_max_m: null      # absolute size cap in metres; overrides scale_pct if set
   color_from_sh: true    # recover RGB from the SH DC term for visual QA
+
+# ---- automated density crop (drop floaters, keep dense region[s]) ----
+# Applied to splat-derived clouds before abstraction. Keeps ALL significant
+# dense clusters (multi-region safe), discards sparse spray.
+crop:
+  enabled: true
+  apply_to_all: false        # true also denoises direct LiDAR clouds
+  work_voxel_m: 0.25         # downsample resolution for clustering
+  radius_outlier_nb: 8       # drop points with fewer than this many neighbours...
+  radius_outlier_r_m: 0.75   # ...within this radius (kills isolated floaters)
+  dbscan_eps_m: 1.0          # cluster connectivity distance
+  dbscan_min_points: 20
+  keep_rel_to_largest: 0.15  # keep clusters >= this fraction of the largest
+  min_cluster_points: 500    # absolute floor for a kept cluster

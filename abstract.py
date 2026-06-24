@@ -101,7 +101,17 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 3, max_nn=30))
     pts_all = np.asarray(pcd.points)
     bounds = (pts_all.min(0), pts_all.max(0))
-    print(f"  loaded {raw_n:,} pts -> {len(pts_all):,} after voxel {voxel} m")
+
+    # DBSCAN eps must scale with the cloud's ACTUAL spacing, not a fixed value:
+    # splat-derived / cropped clouds are far sparser than dense LiDAR, and a
+    # fixed eps labels everything as noise. Measure spacing, set eps >= 5x it.
+    from scipy.spatial import cKDTree
+    _s = pts_all if len(pts_all) <= 20000 else pts_all[
+        np.random.default_rng(0).choice(len(pts_all), 20000, replace=False)]
+    _spacing = float(np.median(cKDTree(_s).query(_s, k=2)[0][:, 1]))
+    eps = max(P["dbscan_eps_m"], 5.0 * _spacing)
+    print(f"  loaded {raw_n:,} pts -> {len(pts_all):,} after voxel {voxel} m "
+          f"(spacing {_spacing:.3f} m, dbscan eps {eps:.2f} m)")
 
     faces = []
     rest = pcd
@@ -118,7 +128,7 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
 
         # split coplanar-but-separate patches
         labels = np.array(plane.cluster_dbscan(
-            eps=P["dbscan_eps_m"], min_points=P["dbscan_min_points"]))
+            eps=eps, min_points=P["dbscan_min_points"]))
         ppts = np.asarray(plane.points)
         for lab in sorted(set(labels)):
             if lab < 0:

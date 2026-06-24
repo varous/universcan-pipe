@@ -16,7 +16,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app import db
 from app.models import VenueIn, MeasurementIn
-from app.pipeline import inspect_file, abstract_file, is_splat, extract_splat
+from app.pipeline import (inspect_file, abstract_file, is_splat, extract_splat,
+                          crop_enabled, auto_crop_file)
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "data"))
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
@@ -116,6 +117,7 @@ def create_scan(
 
     # --- Tier-1 splat routing: if it's a 3DGS splat, extract centres first ---
     splat_info = None
+    crop_info = None
     cloud_for_abstract = ply_path
     if summary.get("is_gaussian_splat") or is_splat(ply_path):
         derived = os.path.join(UPLOAD_DIR, f"{sid}_centres.ply")
@@ -124,6 +126,15 @@ def create_scan(
         except Exception as e:
             raise HTTPException(422, f"splat extraction failed: {e}")
         cloud_for_abstract = derived
+
+        # --- auto density-crop: drop floaters, keep dense region(s) ---
+        if crop_enabled():
+            cropped = os.path.join(UPLOAD_DIR, f"{sid}_cropped.ply")
+            try:
+                crop_info = auto_crop_file(derived, cropped)
+                cloud_for_abstract = cropped
+            except Exception as e:
+                raise HTTPException(422, f"auto-crop failed: {e}")
 
     try:
         manifest = abstract_file(cloud_for_abstract, out_dir, voxel=voxel)
@@ -141,6 +152,7 @@ def create_scan(
         "source_ply_path": ply_path,
         "is_splat_derived": splat_info is not None,
         "splat_extraction": splat_info,        # null for LiDAR; stats for splats
+        "auto_crop": crop_info,                # null unless splat-cropped
         "units": summary.get("inferred_units"),
         "up_axis": summary.get("inferred_up_axis"),
         "gravity_aligned": summary.get("gravity_aligned_Zup"),
