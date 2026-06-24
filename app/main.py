@@ -59,6 +59,17 @@ def inspect(file: UploadFile = File(...)):
         os.remove(tmp)
 
 
+def _with_urls(doc: dict) -> dict:
+    """Add client-usable download URLs derived from the scan's Mongo _id.
+    Relative on purpose: the client prepends whatever host it reached us on."""
+    sid = doc.get("_id")
+    if sid and doc.get("dxf_path"):
+        doc["dxf_url"] = f"/scans/{sid}/dxf"
+    if sid and doc.get("manifest_path"):
+        doc["manifest_url"] = f"/scans/{sid}/manifest"
+    return doc
+
+
 # ---------- venues ----------
 @app.post("/venues")
 def create_venue(v: VenueIn):
@@ -78,7 +89,7 @@ def get_venue(vid: str):
     if not v:
         raise HTTPException(404, "venue not found")
     out = db.ser(v)
-    out["scans"] = [db.ser(s) for s in db.scans_for_venue(d, str(v["_id"]))]
+    out["scans"] = [_with_urls(db.ser(s)) for s in db.scans_for_venue(d, str(v["_id"]))]
     return out
 
 
@@ -168,7 +179,7 @@ def create_scan(
         "status": "abstracted",
     }
     doc = db.create_scan(d, scan_doc)
-    return db.ser(doc)
+    return _with_urls(db.ser(doc))
 
 
 @app.get("/scans/{sid}")
@@ -176,7 +187,7 @@ def read_scan(sid: str):
     s = db.get_scan(db.get_db(), sid)
     if not s:
         raise HTTPException(404, "scan not found")
-    return db.ser(s)
+    return _with_urls(db.ser(s))
 
 
 @app.get("/scans/{sid}/dxf")
