@@ -106,6 +106,9 @@ def flood_fill_interior(src, dst,
         "n_interior_components": int(n_comp),
         "n_interior_regions_kept": len(kept),
         "interior_region_voxels": kept,
+        # bbox of the isolated interior in the cloud's LOCAL frame (for stage-2 crop)
+        "interior_bbox_local": [out_pts.min(0).tolist(), out_pts.max(0).tolist()]
+        if len(out_pts) else None,
         "seconds": round(time.time() - t0, 2),
         "out_extent_m": (out_pts.max(0) - out_pts.min(0)).round(2).tolist()
         if len(out_pts) else None,
