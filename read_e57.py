@@ -62,7 +62,8 @@ def convert(src, dst, voxel=0.03, target_points=3_000_000,
     buffers = libe57.VectorSourceDestBuffer()
     arrays = {}
     for f in use_fields:
-        arr, buf = e.make_buffer(f, block)
+        arr = np.empty(block, dtype=np.float64)
+        buf = libe57.SourceDestBuffer(e.image_file, f, arr, block, True, True)
         arrays[f] = arr
         buffers.append(buf)
 
