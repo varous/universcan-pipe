@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from app import db
 from app.models import VenueIn, MeasurementIn
 from app.pipeline import (inspect_file, abstract_file, is_splat, extract_splat,
-                          crop_enabled, auto_crop_file)
+                          crop_enabled, auto_crop_file, flood_enabled, flood_fill_file)
 
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "..", "data"))
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
@@ -129,6 +129,7 @@ def create_scan(
     # --- Tier-1 splat routing: if it's a 3DGS splat, extract centres first ---
     splat_info = None
     crop_info = None
+    flood_info = None
     cloud_for_abstract = ply_path
     if summary.get("is_gaussian_splat") or is_splat(ply_path):
         derived = os.path.join(UPLOAD_DIR, f"{sid}_centres.ply")
@@ -147,6 +148,15 @@ def create_scan(
             except Exception as e:
                 raise HTTPException(422, f"auto-crop failed: {e}")
 
+    # --- flood-fill indoor isolation: LiDAR/geometry clouds only (splats use crop) ---
+    if flood_enabled() and splat_info is None:
+        flooded = os.path.join(UPLOAD_DIR, f"{sid}_interior.ply")
+        try:
+            flood_info = flood_fill_file(cloud_for_abstract, flooded)
+            cloud_for_abstract = flooded
+        except Exception as e:
+            flood_info = {"skipped": str(e)}   # no interior found -> keep prior cloud
+
     try:
         manifest = abstract_file(cloud_for_abstract, out_dir, voxel=voxel)
     except Exception as e:
@@ -164,6 +174,7 @@ def create_scan(
         "is_splat_derived": splat_info is not None,
         "splat_extraction": splat_info,        # null for LiDAR; stats for splats
         "auto_crop": crop_info,                # null unless splat-cropped
+        "flood_fill": flood_info,              # null unless indoor-isolated
         "units": summary.get("inferred_units"),
         "up_axis": summary.get("inferred_up_axis"),
         "gravity_aligned": summary.get("gravity_aligned_Zup"),

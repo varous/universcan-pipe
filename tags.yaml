@@ -101,3 +101,12 @@ crop:
   dbscan_min_points: 20
   keep_rel_to_largest: 0.15  # keep clusters >= this fraction of the largest
   min_cluster_points: 500    # absolute floor for a kept cluster
+
+# ---- flood-fill indoor isolation (covered-space: roof above + floor below) ----
+# Isolates enclosed interior surfaces and drops outdoor geometry. Doorway-immune.
+# Requires Z-up (inspector guarantees it). Falls back to input cloud if no interior.
+flood_fill:
+  enabled: true
+  fill_voxel_m: 0.2      # coarse occupancy grid for the fill (memory ~ O(1/voxel^3))
+  seal_vox: 2            # closing iters for DATA-GAP holes only (never doorways)
+  min_room_m3: 10.0      # drop interior pockets smaller than this (clutter under objects)

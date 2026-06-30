@@ -11,6 +11,7 @@ from inspect_ply import report as _report          # noqa: E402
 from abstract import run as _run                    # noqa: E402
 from splat import is_splat_ply, extract_centres     # noqa: E402
 from crop import auto_crop as _auto_crop            # noqa: E402
+from flood_fill import flood_fill_interior as _flood # noqa: E402
 import yaml                                          # noqa: E402
 
 TAGS_PATH = os.path.join(ROOT, "tags.yaml")
@@ -57,6 +58,21 @@ def auto_crop_file(src: str, dst: str, tags_path=TAGS_PATH) -> dict:
         dbscan_min_points=c.get("dbscan_min_points", 20),
         keep_rel_to_largest=c.get("keep_rel_to_largest", 0.15),
         min_cluster_points=c.get("min_cluster_points", 500),
+    )
+
+
+def flood_enabled(tags_path=TAGS_PATH) -> bool:
+    return bool(_cfg("flood_fill", tags_path).get("enabled", False))
+
+
+def flood_fill_file(src: str, dst: str, tags_path=TAGS_PATH) -> dict:
+    """Isolate enclosed interior surfaces per tags.yaml:flood_fill (covered-space)."""
+    c = _cfg("flood_fill", tags_path)
+    return _flood(
+        src, dst,
+        fill_voxel=c.get("fill_voxel_m", 0.2),
+        seal_vox=c.get("seal_vox", 2),
+        min_room_m3=c.get("min_room_m3", 10.0),
     )
 
 
