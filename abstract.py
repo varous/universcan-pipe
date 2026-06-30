@@ -102,13 +102,16 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
     pts_all = np.asarray(pcd.points)
     bounds = (pts_all.min(0), pts_all.max(0))
 
-    # DBSCAN eps must scale with the cloud's ACTUAL spacing, not a fixed value:
-    # splat-derived / cropped clouds are far sparser than dense LiDAR, and a
-    # fixed eps labels everything as noise. Measure spacing, set eps >= 5x it.
+    # DBSCAN eps must scale with the cloud's ACTUAL spacing, not a fixed value.
+    # CRITICAL: build the tree on ALL points and only SAMPLE the queries. Building
+    # the tree on a random subsample inflates spacing (a sample's nearest neighbour
+    # is far away because the sample is sparse), which corrupts eps. Tree-on-all,
+    # sample-the-queries gives each query its TRUE nearest neighbour in the cloud.
     from scipy.spatial import cKDTree
-    _s = pts_all if len(pts_all) <= 20000 else pts_all[
+    _tree = cKDTree(pts_all)
+    _q = pts_all if len(pts_all) <= 20000 else pts_all[
         np.random.default_rng(0).choice(len(pts_all), 20000, replace=False)]
-    _spacing = float(np.median(cKDTree(_s).query(_s, k=2)[0][:, 1]))
+    _spacing = float(np.median(_tree.query(_q, k=2)[0][:, 1]))   # k=2: skip self (dist 0)
     eps = max(P["dbscan_eps_m"], 5.0 * _spacing)
     print(f"  loaded {raw_n:,} pts -> {len(pts_all):,} after voxel {voxel} m "
           f"(spacing {_spacing:.3f} m, dbscan eps {eps:.2f} m)")
