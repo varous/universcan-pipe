@@ -78,7 +78,6 @@ def staged_classify(raw, bounds, cfg):
     vcos = cl["vertical_cos"]; hcos = cl["horizontal_cos"]
     band_tol = cl.get("band_tol_m", 1.0)
     perim_frac = cl.get("wall_perim_frac", 0.12)
-    min_wall_h = cl.get("min_wall_height_frac", 0.30) * H
     min_arch_area = cl.get("min_arch_area_m2", 8.0)     # below this = furniture
     ceil_span = cl.get("ceiling_span_m", 3.0)           # top bands within this = ceiling
 
@@ -115,6 +114,7 @@ def staged_classify(raw, bounds, cfg):
     # large bands are architectural; small mid-height bands are furniture
     arch = [b for b in band_recs if b["area"] >= min_arch_area]
     arch.sort(key=lambda b: b["zc"])
+    floor_zc = ceil_zc = None
     if arch:
         floor_zc = arch[0]["zc"]
         ceil_zc = arch[-1]["zc"]
@@ -129,6 +129,15 @@ def staged_classify(raw, bounds, cfg):
     # (small horizontal bands = furniture: intentionally dropped)
 
     # ---- 3. VERTICALS: bbox-relative walls; interior/short -> dropped ----
+    # CRITICAL: gate wall height against the REAL floor-to-ceiling height (from the
+    # detected bands), NOT bbox height. The scan's bbox includes sub-floor structure
+    # (floor sits at z~12, bbox min at 0), so bbox H is ~2x the real room height —
+    # using it rejects every real wall as "too short".
+    if floor_zc is not None and ceil_zc is not None and ceil_zc > floor_zc:
+        room_height = ceil_zc - floor_zc
+    else:
+        room_height = H                                  # fallback: no bands found
+    min_wall_h = cl.get("min_wall_height_frac", 0.30) * room_height
     wall_groups = {"WALL_LEFT": [], "WALL_RIGHT": [],
                    "WALL_FRONT": [], "WALL_REAR": [], "STRUCTURE": []}
     for r in vert:
@@ -198,14 +207,23 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
     print(f"  loaded {raw_n:,} pts -> {len(pts_all):,} after voxel {voxel} m "
           f"(spacing {_spacing:.3f} m, dbscan eps {eps:.2f} m)")
 
+    # Adaptive minimum plane size: on a 13M-point hall, a fixed 800 lets RANSAC
+    # peel hundreds of tiny ceiling fragments and exhaust max_planes BEFORE reaching
+    # the (smaller) walls. Scale the floor with cloud size so big clouds only peel
+    # large planes (real floor/ceiling/walls), leaving budget to reach verticals.
+    # Small clouds (tests) keep the base value.
+    min_pp = max(P["min_plane_points"], int(0.0008 * len(pts_all)))
+    if min_pp != P["min_plane_points"]:
+        print(f"  min_plane_points: {P['min_plane_points']} -> {min_pp} (adaptive, {len(pts_all):,} pts)")
+
     raw_clusters = []
     rest = pcd
     for i in range(P["max_planes"]):
-        if len(rest.points) < P["min_plane_points"]:
+        if len(rest.points) < min_pp:
             break
         model, inl = rest.segment_plane(
             P["ransac_dist_m"], P["ransac_n"], P["ransac_iters"])
-        if len(inl) < P["min_plane_points"]:
+        if len(inl) < min_pp:
             break
         plane = rest.select_by_index(inl)
         rest = rest.select_by_index(inl, invert=True)
@@ -219,9 +237,29 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
             if lab < 0:
                 continue
             cpts = ppts[labels == lab]
-            if len(cpts) < P["min_plane_points"]:
+            if len(cpts) < min_pp:
                 continue
             raw_clusters.append({"normal": normal, "pts": cpts})
+
+    # ---- DIAGNOSTIC: what did RANSAC actually find? ----
+    cl = cfg["classify"]
+    vcos, hcos = cl["vertical_cos"], cl["horizontal_cos"]
+    nh = nv = ns = 0
+    vspans = []
+    for r in raw_clusters:
+        nz = abs(np.array(r["normal"])[2])
+        zspan = r["pts"][:, 2].max() - r["pts"][:, 2].min()
+        if nz >= vcos: nh += 1
+        elif nz <= hcos:
+            nv += 1; vspans.append((round(float(zspan), 1),
+                                    [round(float(x), 1) for x in r["pts"].mean(0)]))
+        else: ns += 1
+    print(f"  RAW PLANES: {len(raw_clusters)}  | horizontal={nh} vertical={nv} sloped={ns}")
+    print(f"    (vcos>={vcos} horiz, <= {hcos} vert)")
+    if vspans:
+        print(f"  VERTICAL planes (zspan, centroid): {vspans[:12]}")
+    else:
+        print("  >> NO VERTICAL PLANES FOUND — walls not in RANSAC output, not a classifier issue")
 
     # staged classification over the WHOLE set (height-band, merge, walls, furniture guard)
     faces = staged_classify(raw_clusters, bounds, cfg)

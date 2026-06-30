@@ -33,7 +33,7 @@ pipeline:
   ransac_n: 3
   ransac_iters: 1000
   min_plane_points: 800
-  max_planes: 40
+  max_planes: 200
   dbscan_eps_m: 0.5
   dbscan_min_points: 25
   simplify_tol_m: 0.1
