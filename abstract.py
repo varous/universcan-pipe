@@ -57,7 +57,52 @@ def _plane_area(pts, normal):
     return float((pu.max() - pu.min()) * (pv.max() - pv.min()))
 
 
-def staged_classify(raw, bounds, cfg):
+class StageLog:
+    """Readable terminal trace + structured debug.json sidecar. Every surface that
+    is kept or dropped is recorded WITH ITS REASON, so a single run shows exactly
+    why each plane became a face or was discarded."""
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.data = {"stages": {}}
+        self._cur = None
+
+    def stage(self, name):
+        self._cur = name
+        self.data["stages"][name] = []
+        if self.enabled:
+            print(f"\n  ── {name} ──")
+
+    def _push(self, rec):
+        if self._cur:
+            self.data["stages"][self._cur].append(rec)
+
+    def info(self, msg, **kv):
+        self._push({"kind": "info", "msg": msg, **kv})
+        if self.enabled:
+            extra = "  ".join(f"{k}={v}" for k, v in kv.items())
+            print(f"     {msg}" + (f"   {extra}" if extra else ""))
+
+    def keep(self, what, tag, **kv):
+        self._push({"kind": "keep", "what": what, "tag": tag, **kv})
+        if self.enabled:
+            extra = " ".join(f"{k}={v}" for k, v in kv.items())
+            print(f"     [KEEP] {what:20s} -> {tag:14s} {extra}")
+
+    def drop(self, what, reason, **kv):
+        self._push({"kind": "drop", "what": what, "reason": reason, **kv})
+        if self.enabled:
+            extra = " ".join(f"{k}={v}" for k, v in kv.items())
+            print(f"     [DROP] {what:20s} -- {reason:28s} {extra}")
+
+    def write(self, path):
+        try:
+            with open(path, "w") as fh:
+                json.dump(self.data, fh, indent=2, default=str)
+        except Exception:
+            pass
+
+
+def staged_classify(raw, bounds, cfg, log=None):
     """
     Stage the WHOLE set of RANSAC planes, not each in isolation. Order:
       1. orientation-split: horizontal / vertical / sloped
@@ -81,6 +126,7 @@ def staged_classify(raw, bounds, cfg):
     min_arch_area = cl.get("min_arch_area_m2", 8.0)     # below this = furniture
     ceil_span = cl.get("ceiling_span_m", 3.0)           # top bands within this = ceiling
 
+    log = log or StageLog(enabled=False)
     horiz, vert, slope = [], [], []
     for r in raw:
         n = np.array(r["normal"]); nz = abs(n[2])
@@ -88,6 +134,10 @@ def staged_classify(raw, bounds, cfg):
         r["zspan"] = float(r["pts"][:, 2].max() - r["pts"][:, 2].min())
         r["area"] = _plane_area(r["pts"], n)
         (horiz if nz >= vcos else vert if nz <= hcos else slope).append(r)
+
+    log.stage("orientation_split")
+    log.info(f"{len(raw)} planes", horizontal=len(horiz), vertical=len(vert),
+             sloped=len(slope))
 
     faces = []
 
@@ -99,6 +149,7 @@ def staged_classify(raw, bounds, cfg):
                       "vertices": [list(np.round(v, 3)) for v in corners]})
 
     # ---- 2. HORIZONTALS: cluster into z-bands, merge, tag by band order ----
+    log.stage("height_bands")
     horiz.sort(key=lambda r: r["zc"])
     bands = []
     for r in horiz:
@@ -110,9 +161,17 @@ def staged_classify(raw, bounds, cfg):
     for b in bands:
         pts = np.vstack([r["pts"] for r in b["items"]])
         band_recs.append({"pts": pts, "zc": float(pts[:, 2].mean()),
-                          "area": _plane_area(pts, np.array([0, 0, 1.0]))})
+                          "area": _plane_area(pts, np.array([0, 0, 1.0])),
+                          "n": int(len(pts)), "frags": len(b["items"])})
+    log.info(f"{len(horiz)} horizontal planes -> {len(bands)} z-bands")
     # large bands are architectural; small mid-height bands are furniture
-    arch = [b for b in band_recs if b["area"] >= min_arch_area]
+    arch = []
+    for b in band_recs:
+        if b["area"] >= min_arch_area:
+            arch.append(b)
+        else:
+            log.drop(f"band z={b['zc']:.1f}", "area < min_arch (furniture)",
+                     area=f"{b['area']:.1f}", min=min_arch_area, n=b["n"])
     arch.sort(key=lambda b: b["zc"])
     floor_zc = ceil_zc = None
     if arch:
@@ -121,12 +180,16 @@ def staged_classify(raw, bounds, cfg):
         for i, b in enumerate(arch):
             up = np.array([0, 0, 1.0])
             if b["zc"] <= floor_zc + band_tol:
-                emit("FLOOR", b["pts"], up)
+                tag = "FLOOR"
             elif b["zc"] >= ceil_zc - ceil_span:
-                emit("CEILING", b["pts"], up)           # top band(s) -> ceiling
+                tag = "CEILING"
             else:
-                emit("STRUCTURE", b["pts"], up)          # mezzanine / platform
-    # (small horizontal bands = furniture: intentionally dropped)
+                tag = "STRUCTURE"
+            log.keep(f"band z={b['zc']:.1f}", tag, area=f"{b['area']:.0f}m2",
+                     n=b["n"], frags=b["frags"])
+            emit(tag, b["pts"], up)
+    else:
+        log.info("no architectural horizontal bands found")
 
     # ---- 3. VERTICALS: bbox-relative walls; interior/short -> dropped ----
     # CRITICAL: gate wall height against the REAL floor-to-ceiling height (from the
@@ -138,24 +201,54 @@ def staged_classify(raw, bounds, cfg):
     else:
         room_height = H                                  # fallback: no bands found
     min_wall_h = cl.get("min_wall_height_frac", 0.30) * room_height
+    log.stage("walls")
+    log.info(f"room_height={room_height:.1f}m  min_wall_height={min_wall_h:.1f}m  "
+             f"perim_band: x={perim_frac*W:.1f}m y={perim_frac*D:.1f}m")
     wall_groups = {"WALL_LEFT": [], "WALL_RIGHT": [],
                    "WALL_FRONT": [], "WALL_REAR": [], "STRUCTURE": []}
     for r in vert:
+        c = r["pts"].mean(0)
+        cstr = f"[{c[0]:.0f},{c[1]:.0f},{c[2]:.0f}]"
         if r["zspan"] < min_wall_h:
-            continue                                     # short vertical = furniture, DROP
-        n = np.array(r["normal"]); c = r["pts"].mean(0)
+            log.drop(f"vert {cstr}", "too short (zspan<min_wall_h)",
+                     zspan=f"{r['zspan']:.1f}", need=f"{min_wall_h:.1f}")
+            continue
+        n = np.array(r["normal"])
+        # distances to each bbox edge (m)
+        dxl, dxh = c[0] - mn[0], mx[0] - c[0]
+        dyl, dyh = c[1] - mn[1], mx[1] - c[1]
         if abs(n[0]) >= abs(n[1]):                       # normal along X -> L/R wall
-            near_lo = (c[0] - mn[0]) <= perim_frac * W
-            near_hi = (mx[0] - c[0]) <= perim_frac * W
-            if near_lo:   wall_groups["WALL_LEFT"].append(r)
-            elif near_hi: wall_groups["WALL_RIGHT"].append(r)
-            elif r["area"] >= min_arch_area: wall_groups["STRUCTURE"].append(r)
+            if dxl <= perim_frac * W:
+                wall_groups["WALL_LEFT"].append(r)
+                log.keep(f"vert {cstr}", "WALL_LEFT", dist_to_edge=f"{dxl:.1f}m")
+            elif dxh <= perim_frac * W:
+                wall_groups["WALL_RIGHT"].append(r)
+                log.keep(f"vert {cstr}", "WALL_RIGHT", dist_to_edge=f"{dxh:.1f}m")
+            elif r["area"] >= min_arch_area:
+                wall_groups["STRUCTURE"].append(r)
+                log.keep(f"vert {cstr}", "STRUCTURE",
+                         reason="interior (not near x-edge)",
+                         nearest_x_edge=f"{min(dxl,dxh):.1f}m",
+                         need=f"{perim_frac*W:.1f}m")
+            else:
+                log.drop(f"vert {cstr}", "interior + small",
+                         nearest_x_edge=f"{min(dxl,dxh):.1f}m", area=f"{r['area']:.0f}")
         else:                                            # normal along Y -> F/R wall
-            near_lo = (c[1] - mn[1]) <= perim_frac * D
-            near_hi = (mx[1] - c[1]) <= perim_frac * D
-            if near_lo:   wall_groups["WALL_FRONT"].append(r)
-            elif near_hi: wall_groups["WALL_REAR"].append(r)
-            elif r["area"] >= min_arch_area: wall_groups["STRUCTURE"].append(r)
+            if dyl <= perim_frac * D:
+                wall_groups["WALL_FRONT"].append(r)
+                log.keep(f"vert {cstr}", "WALL_FRONT", dist_to_edge=f"{dyl:.1f}m")
+            elif dyh <= perim_frac * D:
+                wall_groups["WALL_REAR"].append(r)
+                log.keep(f"vert {cstr}", "WALL_REAR", dist_to_edge=f"{dyh:.1f}m")
+            elif r["area"] >= min_arch_area:
+                wall_groups["STRUCTURE"].append(r)
+                log.keep(f"vert {cstr}", "STRUCTURE",
+                         reason="interior (not near y-edge)",
+                         nearest_y_edge=f"{min(dyl,dyh):.1f}m",
+                         need=f"{perim_frac*D:.1f}m")
+            else:
+                log.drop(f"vert {cstr}", "interior + small",
+                         nearest_y_edge=f"{min(dyl,dyh):.1f}m", area=f"{r['area']:.0f}")
     # ---- 4. merge fragments per side -> one face per wall ----
     for tag, items in wall_groups.items():
         if not items:
@@ -163,6 +256,8 @@ def staged_classify(raw, bounds, cfg):
         pts = np.vstack([r["pts"] for r in items])
         nrm = np.mean([np.array(r["normal"]) for r in items], axis=0)
         nrm /= (np.linalg.norm(nrm) or 1.0)
+        if len(items) > 1:
+            log.info(f"merged {len(items)} fragments -> {tag}")
         emit(tag, pts, nrm)
 
     # ---- sloped surfaces -> raked audience (only if sizeable) ----
@@ -177,11 +272,13 @@ def staged_classify(raw, bounds, cfg):
     return faces
 
 
-def run(ply_path, tags_path, out_dir, voxel_override=None):
+def run(ply_path, tags_path, out_dir, voxel_override=None, debug=False):
     cfg = load_cfg(tags_path)
     P = cfg["pipeline"]
     voxel = voxel_override or P["voxel_m"]
     os.makedirs(out_dir, exist_ok=True)
+    debug = debug or bool(cfg.get("debug", False))
+    log = StageLog(enabled=debug)
 
     pcd = o3d.io.read_point_cloud(ply_path)
     if len(pcd.points) == 0:
@@ -204,6 +301,10 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
         np.random.default_rng(0).choice(len(pts_all), 20000, replace=False)]
     _spacing = float(np.median(_tree.query(_q, k=2)[0][:, 1]))   # k=2: skip self (dist 0)
     eps = max(P["dbscan_eps_m"], 5.0 * _spacing)
+    log.stage("load")
+    log.info(f"{raw_n:,} pts -> {len(pts_all):,} after voxel {voxel}m",
+             spacing=f"{_spacing:.3f}m", eps=f"{eps:.2f}m",
+             bbox=[round(float(x), 1) for x in bounds[1]])
     print(f"  loaded {raw_n:,} pts -> {len(pts_all):,} after voxel {voxel} m "
           f"(spacing {_spacing:.3f} m, dbscan eps {eps:.2f} m)")
 
@@ -216,6 +317,7 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
     if min_pp != P["min_plane_points"]:
         print(f"  min_plane_points: {P['min_plane_points']} -> {min_pp} (adaptive, {len(pts_all):,} pts)")
 
+    log.stage("ransac_peel")
     raw_clusters = []
     rest = pcd
     for i in range(P["max_planes"]):
@@ -228,6 +330,11 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
         plane = rest.select_by_index(inl)
         rest = rest.select_by_index(inl, invert=True)
         normal = np.array(model[:3]); normal /= np.linalg.norm(normal)
+        nz = abs(normal[2])
+        ori = "H" if nz >= cfg["classify"]["vertical_cos"] else \
+              "V" if nz <= cfg["classify"]["horizontal_cos"] else "S"
+        log.info(f"plane {i:3d}", inliers=len(inl), ori=ori,
+                 normal=[round(float(x), 2) for x in normal])
 
         # split coplanar-but-separate patches into clusters
         labels = np.array(plane.cluster_dbscan(
@@ -255,14 +362,19 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
                                     [round(float(x), 1) for x in r["pts"].mean(0)]))
         else: ns += 1
     print(f"  RAW PLANES: {len(raw_clusters)}  | horizontal={nh} vertical={nv} sloped={ns}")
-    print(f"    (vcos>={vcos} horiz, <= {hcos} vert)")
-    if vspans:
-        print(f"  VERTICAL planes (zspan, centroid): {vspans[:12]}")
-    else:
+    if not vspans:
         print("  >> NO VERTICAL PLANES FOUND — walls not in RANSAC output, not a classifier issue")
 
     # staged classification over the WHOLE set (height-band, merge, walls, furniture guard)
-    faces = staged_classify(raw_clusters, bounds, cfg)
+    faces = staged_classify(raw_clusters, bounds, cfg, log=log)
+
+    log.stage("summary")
+    from collections import Counter
+    log.info("final faces", **{k: v for k, v in Counter(f["tag"] for f in faces).items()})
+    if debug:
+        dbg_path = os.path.join(out_dir, "debug.json")
+        log.write(dbg_path)
+        print(f"  debug trace -> {dbg_path}")
 
     # ---- emit manifest.json --------------------------------------
     manifest = {"source": ply_path, "voxel_m": voxel,
@@ -298,5 +410,7 @@ if __name__ == "__main__":
     ap.add_argument("--tags", default="tags.yaml")
     ap.add_argument("--out", default="out")
     ap.add_argument("--voxel", type=float, default=None)
+    ap.add_argument("--debug", action="store_true",
+                    help="print per-stage trace and write debug.json")
     a = ap.parse_args()
-    run(a.ply, a.tags, a.out, a.voxel)
+    run(a.ply, a.tags, a.out, a.voxel, debug=a.debug)
