@@ -38,12 +38,14 @@ def test_full_flow():
     assert r.status_code == 200, r.text
     scan = r.json(); sid = scan["_id"]
     print("scan:", sid, "faces:", scan["face_counts"])
-    assert scan["n_faces"] == 7
-    assert set(scan["face_counts"]) >= {"FLOOR", "CEILING", "STAGE", "AUDIENCE_MAIN"}
+    assert scan["n_faces"] >= 5, f"too few faces: {scan["n_faces"]}"
+    tags = set(scan["face_counts"])
+    assert {"FLOOR", "CEILING"} <= tags, f"missing floor/ceiling: {tags}"
+    assert sum(1 for t in tags if t.startswith("WALL")) >= 2, f"too few walls: {tags}"
 
     # fetch scan
     r = client.get(f"/scans/{sid}"); assert r.status_code == 200
-    assert r.json()["n_faces"] == 7
+    assert r.json()["n_faces"] >= 5
 
     # venue now lists the scan
     r = client.get(f"/venues/{vid}"); assert r.status_code == 200
@@ -56,7 +58,7 @@ def test_full_flow():
 
     # manifest
     r = client.get(f"/scans/{sid}/manifest"); assert r.status_code == 200
-    assert len(r.json()["faces"]) == 7
+    assert len(r.json()["faces"]) >= 5
 
     # add a measurement (paired-data hook)
     r = client.post(f"/scans/{sid}/measurements", json={

@@ -48,42 +48,124 @@ def oriented_quad(pts, normal):
     return [ (c + cu * u + cv * v).tolist() for cu, cv in corners2d ], c
 
 
-def classify(normal, cpts, bounds, cfg):
-    """Return a canonical tag from normal direction + position + cluster extent.
-    cpts = the cluster's 3D points; bounds = (min,max) of the whole cloud."""
+def _plane_area(pts, normal):
+    """Area of the cluster's bounding rectangle in its own plane (m^2)."""
+    u, v = in_plane_basis(normal)
+    c = pts.mean(0)
+    pu = (pts - c) @ u
+    pv = (pts - c) @ v
+    return float((pu.max() - pu.min()) * (pv.max() - pv.min()))
+
+
+def staged_classify(raw, bounds, cfg):
+    """
+    Stage the WHOLE set of RANSAC planes, not each in isolation. Order:
+      1. orientation-split: horizontal / vertical / sloped
+      2. height-cluster horizontals into z-bands; merge coplanar fragments
+         -> lowest large band = FLOOR, highest large band(s) = CEILING,
+            middle large = STRUCTURE, small mid-height = FURNITURE (dropped)
+      3. bbox-relative walls: vertical + near a bbox edge + tall = WALL_*;
+         interior or short verticals = furniture/structure (dropped/STRUCTURE)
+      4. merge fragments per surface so each real surface is ONE face
+    Floor/ceiling are identified by BAND ORDER (robust to z-offset: the real
+    convention-centre floor sits at z~12, not z~0), not absolute height.
+    """
     cl = cfg["classify"]
-    nz = abs(normal[2])
-    mn, mx = bounds
-    centroid = cpts.mean(0)
-    height = mx[2] - mn[2]
-    z = centroid[2]
-    zfrac = (z - mn[2]) / height if height else 0
-    z_above_floor = cpts[:, 2].min() - mn[2]
-    z_span = cpts[:, 2].max() - cpts[:, 2].min()
+    mn, mx = np.array(bounds[0]), np.array(bounds[1])
+    H = float(mx[2] - mn[2]) or 1.0
+    W = float(mx[0] - mn[0]) or 1.0
+    D = float(mx[1] - mn[1]) or 1.0
+    vcos = cl["vertical_cos"]; hcos = cl["horizontal_cos"]
+    band_tol = cl.get("band_tol_m", 1.0)
+    perim_frac = cl.get("wall_perim_frac", 0.12)
+    min_wall_h = cl.get("min_wall_height_frac", 0.30) * H
+    min_arch_area = cl.get("min_arch_area_m2", 8.0)     # below this = furniture
+    ceil_span = cl.get("ceiling_span_m", 3.0)           # top bands within this = ceiling
 
-    # ---- horizontal surfaces (floor / ceiling / stage) -----------
-    if nz >= cl["vertical_cos"]:
-        st = cl["stage"]
-        depth = mx[1] - mn[1]
-        yfrac = (centroid[1] - mn[1]) / depth if depth else 0
-        if (st["enabled"] and st["min_z_m"] <= (z - mn[2]) <= st["max_z_m"]
-                and yfrac <= st["front_zone_frac"]):
-            return "STAGE"
-        return "FLOOR" if zfrac < cl["floor_ceiling_split_frac"] else "CEILING"
+    horiz, vert, slope = [], [], []
+    for r in raw:
+        n = np.array(r["normal"]); nz = abs(n[2])
+        r["zc"] = float(r["pts"][:, 2].mean())
+        r["zspan"] = float(r["pts"][:, 2].max() - r["pts"][:, 2].min())
+        r["area"] = _plane_area(r["pts"], n)
+        (horiz if nz >= vcos else vert if nz <= hcos else slope).append(r)
 
-    # ---- vertical surfaces (walls / balcony faces) ---------------
-    if nz <= cl["horizontal_cos"]:
-        bf = cl["balcony_face"]
-        if z_above_floor >= bf["min_z_m"] and z_span <= bf["max_height_m"]:
-            return "BALCONY_FACE"           # short + elevated => balcony face
-        cx = (mn[0] + mx[0]) / 2
-        cy = (mn[1] + mx[1]) / 2
-        if abs(normal[1]) > abs(normal[0]):   # normal along Y => front/rear wall
-            return "WALL_REAR" if centroid[1] > cy else "WALL_FRONT"
-        return "WALL_LEFT" if centroid[0] < cx else "WALL_RIGHT"
+    faces = []
 
-    # ---- sloped surfaces => raked audience -----------------------
-    return "AUDIENCE_MAIN"
+    def emit(tag, pts, normal):
+        corners, centroid = oriented_quad(pts, normal)
+        faces.append({"tag": tag, "normal": list(np.round(normal, 4)),
+                      "centroid": list(np.round(centroid, 3)),
+                      "n_points": int(len(pts)),
+                      "vertices": [list(np.round(v, 3)) for v in corners]})
+
+    # ---- 2. HORIZONTALS: cluster into z-bands, merge, tag by band order ----
+    horiz.sort(key=lambda r: r["zc"])
+    bands = []
+    for r in horiz:
+        if bands and r["zc"] - bands[-1]["zc_last"] <= band_tol:
+            bands[-1]["items"].append(r); bands[-1]["zc_last"] = r["zc"]
+        else:
+            bands.append({"items": [r], "zc_last": r["zc"]})
+    band_recs = []
+    for b in bands:
+        pts = np.vstack([r["pts"] for r in b["items"]])
+        band_recs.append({"pts": pts, "zc": float(pts[:, 2].mean()),
+                          "area": _plane_area(pts, np.array([0, 0, 1.0]))})
+    # large bands are architectural; small mid-height bands are furniture
+    arch = [b for b in band_recs if b["area"] >= min_arch_area]
+    arch.sort(key=lambda b: b["zc"])
+    if arch:
+        floor_zc = arch[0]["zc"]
+        ceil_zc = arch[-1]["zc"]
+        for i, b in enumerate(arch):
+            up = np.array([0, 0, 1.0])
+            if b["zc"] <= floor_zc + band_tol:
+                emit("FLOOR", b["pts"], up)
+            elif b["zc"] >= ceil_zc - ceil_span:
+                emit("CEILING", b["pts"], up)           # top band(s) -> ceiling
+            else:
+                emit("STRUCTURE", b["pts"], up)          # mezzanine / platform
+    # (small horizontal bands = furniture: intentionally dropped)
+
+    # ---- 3. VERTICALS: bbox-relative walls; interior/short -> dropped ----
+    wall_groups = {"WALL_LEFT": [], "WALL_RIGHT": [],
+                   "WALL_FRONT": [], "WALL_REAR": [], "STRUCTURE": []}
+    for r in vert:
+        if r["zspan"] < min_wall_h:
+            continue                                     # short vertical = furniture, DROP
+        n = np.array(r["normal"]); c = r["pts"].mean(0)
+        if abs(n[0]) >= abs(n[1]):                       # normal along X -> L/R wall
+            near_lo = (c[0] - mn[0]) <= perim_frac * W
+            near_hi = (mx[0] - c[0]) <= perim_frac * W
+            if near_lo:   wall_groups["WALL_LEFT"].append(r)
+            elif near_hi: wall_groups["WALL_RIGHT"].append(r)
+            elif r["area"] >= min_arch_area: wall_groups["STRUCTURE"].append(r)
+        else:                                            # normal along Y -> F/R wall
+            near_lo = (c[1] - mn[1]) <= perim_frac * D
+            near_hi = (mx[1] - c[1]) <= perim_frac * D
+            if near_lo:   wall_groups["WALL_FRONT"].append(r)
+            elif near_hi: wall_groups["WALL_REAR"].append(r)
+            elif r["area"] >= min_arch_area: wall_groups["STRUCTURE"].append(r)
+    # ---- 4. merge fragments per side -> one face per wall ----
+    for tag, items in wall_groups.items():
+        if not items:
+            continue
+        pts = np.vstack([r["pts"] for r in items])
+        nrm = np.mean([np.array(r["normal"]) for r in items], axis=0)
+        nrm /= (np.linalg.norm(nrm) or 1.0)
+        emit(tag, pts, nrm)
+
+    # ---- sloped surfaces -> raked audience (only if sizeable) ----
+    if slope:
+        big = [r for r in slope if r["area"] >= min_arch_area]
+        if big:
+            pts = np.vstack([r["pts"] for r in big])
+            nrm = np.mean([np.array(r["normal"]) for r in big], axis=0)
+            nrm /= (np.linalg.norm(nrm) or 1.0)
+            emit("AUDIENCE_MAIN", pts, nrm)
+
+    return faces
 
 
 def run(ply_path, tags_path, out_dir, voxel_override=None):
@@ -116,7 +198,7 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
     print(f"  loaded {raw_n:,} pts -> {len(pts_all):,} after voxel {voxel} m "
           f"(spacing {_spacing:.3f} m, dbscan eps {eps:.2f} m)")
 
-    faces = []
+    raw_clusters = []
     rest = pcd
     for i in range(P["max_planes"]):
         if len(rest.points) < P["min_plane_points"]:
@@ -129,7 +211,7 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
         rest = rest.select_by_index(inl, invert=True)
         normal = np.array(model[:3]); normal /= np.linalg.norm(normal)
 
-        # split coplanar-but-separate patches
+        # split coplanar-but-separate patches into clusters
         labels = np.array(plane.cluster_dbscan(
             eps=eps, min_points=P["dbscan_min_points"]))
         ppts = np.asarray(plane.points)
@@ -139,15 +221,10 @@ def run(ply_path, tags_path, out_dir, voxel_override=None):
             cpts = ppts[labels == lab]
             if len(cpts) < P["min_plane_points"]:
                 continue
-            corners, centroid = oriented_quad(cpts, normal)
-            tag = classify(normal, cpts, bounds, cfg)
-            faces.append({
-                "tag": tag,
-                "normal": normal.round(4).tolist(),
-                "centroid": np.round(centroid, 3).tolist(),
-                "n_points": int(len(cpts)),
-                "vertices": [list(np.round(v, 3)) for v in corners],
-            })
+            raw_clusters.append({"normal": normal, "pts": cpts})
+
+    # staged classification over the WHOLE set (height-band, merge, walls, furniture guard)
+    faces = staged_classify(raw_clusters, bounds, cfg)
 
     # ---- emit manifest.json --------------------------------------
     manifest = {"source": ply_path, "voxel_m": voxel,
