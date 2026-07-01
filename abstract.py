@@ -318,35 +318,54 @@ def run(ply_path, tags_path, out_dir, voxel_override=None, debug=False):
         print(f"  min_plane_points: {P['min_plane_points']} -> {min_pp} (adaptive, {len(pts_all):,} pts)")
 
     log.stage("ransac_peel")
-    raw_clusters = []
-    rest = pcd
-    for i in range(P["max_planes"]):
-        if len(rest.points) < min_pp:
-            break
-        model, inl = rest.segment_plane(
-            P["ransac_dist_m"], P["ransac_n"], P["ransac_iters"])
-        if len(inl) < min_pp:
-            break
-        plane = rest.select_by_index(inl)
-        rest = rest.select_by_index(inl, invert=True)
-        normal = np.array(model[:3]); normal /= np.linalg.norm(normal)
-        nz = abs(normal[2])
-        ori = "H" if nz >= cfg["classify"]["vertical_cos"] else \
-              "V" if nz <= cfg["classify"]["horizontal_cos"] else "S"
-        log.info(f"plane {i:3d}", inliers=len(inl), ori=ori,
-                 normal=[round(float(x), 2) for x in normal])
 
-        # split coplanar-but-separate patches into clusters
-        labels = np.array(plane.cluster_dbscan(
-            eps=eps, min_points=P["dbscan_min_points"]))
-        ppts = np.asarray(plane.points)
-        for lab in sorted(set(labels)):
-            if lab < 0:
-                continue
-            cpts = ppts[labels == lab]
-            if len(cpts) < min_pp:
-                continue
-            raw_clusters.append({"normal": normal, "pts": cpts})
+    def _peel(subset, budget, label):
+        """Peel planes from a point subset with its own budget. Returns raw clusters."""
+        clusters = []
+        rest = subset
+        for i in range(budget):
+            if len(rest.points) < min_pp:
+                break
+            model, inl = rest.segment_plane(
+                P["ransac_dist_m"], P["ransac_n"], P["ransac_iters"])
+            if len(inl) < min_pp:
+                break
+            plane = rest.select_by_index(inl)
+            rest = rest.select_by_index(inl, invert=True)
+            normal = np.array(model[:3]); normal /= np.linalg.norm(normal)
+            nz = abs(normal[2])
+            ori = "H" if nz >= cfg["classify"]["vertical_cos"] else \
+                  "V" if nz <= cfg["classify"]["horizontal_cos"] else "S"
+            log.info(f"{label} plane {i:3d}", inliers=len(inl), ori=ori,
+                     normal=[round(float(x), 2) for x in normal])
+            labels = np.array(plane.cluster_dbscan(
+                eps=eps, min_points=P["dbscan_min_points"]))
+            ppts = np.asarray(plane.points)
+            for lab in sorted(set(labels)):
+                if lab < 0:
+                    continue
+                cpts = ppts[labels == lab]
+                if len(cpts) < min_pp:
+                    continue
+                clusters.append({"normal": normal, "pts": cpts})
+        return clusters
+
+    # ---- ROOT-CAUSE FIX: split by point-normal orientation, peel separately ----
+    # Horizontal surfaces (floor/ceiling) fragment into dozens of coplanar slices and,
+    # in a single shared peel, exhaust the budget BEFORE walls are reached. Splitting
+    # the cloud by each point's estimated normal gives walls their OWN budget, so they
+    # can't be starved. nz = |normal_z|: ~1 => horizontal surface, ~0 => vertical.
+    vcos = cfg["classify"]["vertical_cos"]
+    pn = np.abs(np.asarray(pcd.normals)[:, 2])
+    horiz_idx = np.where(pn >= vcos)[0]
+    rest_idx = np.where(pn < vcos)[0]                    # vertical + sloped
+    pcd_h = pcd.select_by_index(horiz_idx)
+    pcd_v = pcd.select_by_index(rest_idx)
+    log.info(f"normal-split: {len(horiz_idx):,} horizontal-surface pts, "
+             f"{len(rest_idx):,} vertical/sloped pts")
+
+    raw_clusters = _peel(pcd_h, P["max_planes"], "H")    # floor/ceiling (own budget)
+    raw_clusters += _peel(pcd_v, P["max_planes"], "V")   # walls (own budget — not starved)
 
     # ---- DIAGNOSTIC: what did RANSAC actually find? ----
     cl = cfg["classify"]
