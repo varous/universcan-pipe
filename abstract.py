@@ -350,22 +350,98 @@ def run(ply_path, tags_path, out_dir, voxel_override=None, debug=False):
                 clusters.append({"normal": normal, "pts": cpts})
         return clusters
 
-    # ---- ROOT-CAUSE FIX: split by point-normal orientation, peel separately ----
-    # Horizontal surfaces (floor/ceiling) fragment into dozens of coplanar slices and,
-    # in a single shared peel, exhaust the budget BEFORE walls are reached. Splitting
-    # the cloud by each point's estimated normal gives walls their OWN budget, so they
-    # can't be starved. nz = |normal_z|: ~1 => horizontal surface, ~0 => vertical.
-    vcos = cfg["classify"]["vertical_cos"]
-    pn = np.abs(np.asarray(pcd.normals)[:, 2])
-    horiz_idx = np.where(pn >= vcos)[0]
-    rest_idx = np.where(pn < vcos)[0]                    # vertical + sloped
-    pcd_h = pcd.select_by_index(horiz_idx)
-    pcd_v = pcd.select_by_index(rest_idx)
-    log.info(f"normal-split: {len(horiz_idx):,} horizontal-surface pts, "
-             f"{len(rest_idx):,} vertical/sloped pts")
+    def _peel_vmodels(subset, budget):
+        """Peel from a subset, returning VERTICAL plane MODELS (a,b,c,d) only.
+        Used for wall detection on the z-stripped (mid-height) cloud."""
+        models = []
+        rest = subset
+        for i in range(budget):
+            if len(rest.points) < min_pp:
+                break
+            model, inl = rest.segment_plane(
+                P["ransac_dist_m"], P["ransac_n"], P["ransac_iters"])
+            if len(inl) < min_pp:
+                break
+            rest = rest.select_by_index(inl, invert=True)
+            normal = np.array(model[:3]); normal /= np.linalg.norm(normal)
+            nz = abs(normal[2])
+            ori = "H" if nz >= cfg["classify"]["vertical_cos"] else \
+                  "V" if nz <= cfg["classify"]["horizontal_cos"] else "S"
+            log.info(f"Vdet plane {i:3d}", inliers=len(inl), ori=ori)
+            if nz <= cfg["classify"]["horizontal_cos"]:      # keep verticals only
+                models.append(np.array(model))
+        return models
 
-    raw_clusters = _peel(pcd_h, P["max_planes"], "H")    # floor/ceiling (own budget)
-    raw_clusters += _peel(pcd_v, P["max_planes"], "V")   # walls (own budget — not starved)
+    # ---- ROOT-CAUSE FIX: detect-stripped / fit-full ----
+    # 1) horizontal pass finds floor/ceiling z. 2) STRIP those z-bands and detect
+    # walls on the mid-height remainder (wall-dominated, no starvation). 3) each wall
+    # plane is RE-ASSOCIATED to the FULL cloud (points within ransac_dist of the plane)
+    # so the foot & top stripped for detection are reclaimed -> walls span floor..ceiling.
+    vcos = cfg["classify"]["vertical_cos"]
+    hcos = cfg["classify"]["horizontal_cos"]
+    strip_margin = P.get("wall_strip_margin_m", 1.0)
+    pn = np.abs(np.asarray(pcd.normals)[:, 2])
+
+    # 1) horizontal detection (own budget) -> floor/ceiling heights + horiz clusters
+    pcd_h = pcd.select_by_index(np.where(pn >= vcos)[0])
+    horiz_clusters = _peel(pcd_h, P["max_planes"], "H")
+    floor_z = ceil_z = None
+    if horiz_clusters:
+        # Cluster horizontal planes into z-bands (fragmentation-robust), then take the
+        # lowest and highest bands with meaningful total point-mass as floor/ceiling.
+        # (A raw per-cluster size threshold fails when floor/ceiling shatter into many
+        # small coplanar fragments — each fragment is individually small.)
+        band_tol = cfg["classify"].get("band_tol_m", 1.0)
+        hc = sorted(horiz_clusters, key=lambda c: float(c["pts"][:, 2].mean()))
+        zbands = []
+        for c in hc:
+            zc = float(c["pts"][:, 2].mean()); npts = len(c["pts"])
+            if zbands and zc - zbands[-1]["z"] <= band_tol:
+                b = zbands[-1]
+                b["z"] = (b["z"] * b["n"] + zc * npts) / (b["n"] + npts)
+                b["n"] += npts
+            else:
+                zbands.append({"z": zc, "n": npts})
+        tot = sum(b["n"] for b in zbands)
+        big = [b for b in zbands if b["n"] >= 0.03 * tot]   # bands with real mass
+        if big:
+            floor_z, ceil_z = big[0]["z"], big[-1]["z"]
+            bands_str = ", ".join(f"{b['z']:.1f}m(n={b['n']})" for b in zbands)
+            log.info(f"z-bands: [{bands_str}]",
+                     floor_z=f"{floor_z:.1f}", ceil_z=f"{ceil_z:.1f}")
+
+    # 2) + 3) z-strip detection then re-associate to full cloud
+    vert_clusters = []
+    if floor_z is not None and ceil_z is not None and (ceil_z - floor_z) > 2 * strip_margin:
+        z = pts_all[:, 2]
+        mid = np.where((z > floor_z + strip_margin) & (z < ceil_z - strip_margin))[0]
+        log.info(f"z-strip: floor_z={floor_z:.1f} ceil_z={ceil_z:.1f}  "
+                 f"{len(mid):,} mid-height pts for wall detection")
+        models = _peel_vmodels(pcd.select_by_index(mid), P["max_planes"])
+        log.info(f"detected {len(models)} vertical plane models -> re-associating full cloud")
+        for m in models:
+            nrm = m[:3] / (np.linalg.norm(m[:3]) or 1.0)
+            dist = np.abs(pts_all @ nrm + m[3] / (np.linalg.norm(m[:3]) or 1.0))
+            onp = pts_all[dist <= P["ransac_dist_m"]]        # FULL-height points on plane
+            if len(onp) < min_pp:
+                continue
+            opc = o3d.geometry.PointCloud()
+            opc.points = o3d.utility.Vector3dVector(onp)
+            labels = np.array(opc.cluster_dbscan(eps=eps, min_points=P["dbscan_min_points"]))
+            for lab in sorted(set(labels)):
+                if lab < 0:
+                    continue
+                cpts = onp[labels == lab]
+                if len(cpts) < min_pp:
+                    continue
+                vert_clusters.append({"normal": nrm, "pts": cpts})
+    else:
+        # fallback: no clear floor/ceiling -> peel verticals from non-horizontal pts
+        log.info("no clear floor/ceiling bands; vertical fallback peel")
+        vert_clusters = _peel(pcd.select_by_index(np.where(pn < vcos)[0]),
+                              P["max_planes"], "V")
+
+    raw_clusters = horiz_clusters + vert_clusters
 
     # ---- DIAGNOSTIC: what did RANSAC actually find? ----
     cl = cfg["classify"]
