@@ -102,6 +102,65 @@ class StageLog:
             pass
 
 
+def estimate_yaw(pts_all, log=None, n_sample=200_000, bin_m=0.1):
+    """Estimate the venue's yaw (rotation about Z) so walls become axis-aligned.
+
+    SLAM scanners (Lixel etc.) gravity-align Z via IMU, but XY heading is ARBITRARY
+    (whichever way the operator faced at start). A rotated hall makes every wall
+    diagonal: not at constant X or Y, so it SMEARS across histogram bins instead of
+    spiking — the axis-aligned wall detector goes blind.
+
+    Estimation uses the same statistic as detection: at the CORRECT yaw, walls collapse
+    into sharp X/Y histogram spikes (high max bin); at the wrong yaw they smear (low).
+    Sweep 0..90 deg (walls repeat every 90), coarse then refined, score = sharpest bin.
+    Returns yaw_deg to rotate the cloud BY (about Z) to axis-align it.
+    """
+    z = pts_all[:, 2]
+    # quick z-levels to strip floor/ceiling (their XY spread is uniform = pure baseline)
+    lo, hi = float(z.min()), float(z.max())
+    nb = max(10, int((hi - lo) / 0.3))
+    hist, edges = np.histogram(z, bins=nb)
+    centers = (edges[:-1] + edges[1:]) / 2
+    lv = centers[hist >= 0.08 * hist.max()]
+    if len(lv):
+        fz, cz = float(lv.min()), float(lv.max())
+        tol = max(0.3, (cz - fz) * 0.12)
+        mid = pts_all[(np.abs(z - fz) > tol) & (np.abs(z - cz) > tol)]
+    else:
+        mid = pts_all
+    if len(mid) > n_sample:
+        mid = mid[np.random.default_rng(0).choice(len(mid), n_sample, replace=False)]
+    xy = mid[:, :2]
+
+    def sharp(theta_deg):
+        t = np.radians(theta_deg)
+        c, s = np.cos(t), np.sin(t)
+        rx = xy[:, 0] * c - xy[:, 1] * s
+        ry = xy[:, 0] * s + xy[:, 1] * c
+        best = 0
+        for v in (rx, ry):
+            vnb = max(10, int((v.max() - v.min()) / bin_m))
+            h, _ = np.histogram(v, bins=vnb)
+            best = max(best, int(h.max()))
+        return best
+
+    coarse = [(sharp(t), t) for t in range(0, 90, 2)]
+    s0 = dict((t, s) for s, t in coarse)[0]
+    s_best, t_best = max(coarse)
+    for t in np.arange(t_best - 2, t_best + 2.01, 0.25):     # refine
+        s = sharp(t % 90)
+        if s > s_best:
+            s_best, t_best = s, t % 90
+    # fold to smallest equivalent rotation (walls repeat every 90 deg)
+    yaw = t_best if t_best <= 45 else t_best - 90
+    if log:
+        log.info(f"yaw sweep: sharpness at 0deg={s0}  best={s_best} at {t_best:.2f}deg")
+    # only rotate when it genuinely helps; tiny/no gain = already aligned
+    if abs(yaw) < 0.5 or s_best < 1.15 * s0:
+        return 0.0
+    return float(yaw)
+
+
 def detect_walls_hist(pts_all, band_z, band_tol, bounds, min_pp, eps, cfg, log=None):
     """Find walls STATISTICALLY as peaks in the X and Y histograms — no normals.
 
@@ -367,6 +426,20 @@ def run(ply_path, tags_path, out_dir, voxel_override=None, debug=False):
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 3, max_nn=30))
     pts_all = np.asarray(pcd.points)
+
+    # ---- YAW ALIGNMENT (SLAM heading is arbitrary; walls must be axis-aligned) ----
+    # Rotate the whole venue about Z so walls collapse into sharp X/Y histogram spikes.
+    # Z is untouched (floor/ceiling invariant). Downstream sim tools want this anyway.
+    yaw = estimate_yaw(pts_all, log=log)
+    if yaw != 0.0:
+        t = np.radians(yaw)
+        c, s = np.cos(t), np.sin(t)
+        R = np.array([[c, -s], [s, c]])
+        pts_all = pts_all.copy()
+        pts_all[:, :2] = pts_all[:, :2] @ R.T
+        pts_all[:, :2] -= pts_all[:, :2].min(0)          # keep local frame at origin
+        pcd.points = o3d.utility.Vector3dVector(pts_all)
+        log.info(f"yaw-aligned: rotated {yaw:+.2f} deg about Z (recorded in manifest)")
     bounds = (pts_all.min(0), pts_all.max(0))
 
     # DBSCAN eps must scale with the cloud's ACTUAL spacing, not a fixed value.
@@ -524,6 +597,7 @@ def run(ply_path, tags_path, out_dir, voxel_override=None, debug=False):
 
     # ---- emit manifest.json --------------------------------------
     manifest = {"source": ply_path, "voxel_m": voxel,
+                "yaw_aligned_deg": round(yaw, 2),
                 "n_faces": len(faces), "faces": faces}
     mpath = os.path.join(out_dir, "manifest.json")
     with open(mpath, "w") as fh:
