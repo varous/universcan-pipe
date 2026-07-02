@@ -1,3 +1,27 @@
+# =============================================================================
+# universcan-pipe -- configuration (tags.yaml)   [ASCII only; no smart quotes/dashes]
+# =============================================================================
+# Pipeline stages, in order:
+#   1. read_e57.py   : stream a full-scale E57 -> manageable .ply (+ .meta.json)
+#   2. flood_fill.py : covered-space test isolates indoor surfaces (flood_fill block)
+#   3. abstract.py   : detect surfaces -> tagged faces -> DXF
+#
+# How abstract.py finds surfaces (all statistical, NORMAL-FREE):
+#   FLOOR / CEILING    = peaks in the Z histogram (where points pile up in height)
+#   LEFT / RIGHT walls = peaks in the X histogram (wall perp to X = constant X = a spike)
+#   FRONT / REAR walls = peaks in the Y histogram
+#   A wall is sparse in 3D but becomes a dense peak when projected onto its
+#   perpendicular axis, so it is found statistically, not by RANSAC plane-peeling
+#   (RANSAC ranks by inlier count, so sparse walls always lose to dense clutter).
+#   Each wall peak is re-associated to the FULL cloud so it spans floor-to-ceiling,
+#   then validated: long + tall = WALL, short = column -> STRUCTURE.
+#   Furniture dropped by min_arch_area_m2. Assumes axis-aligned walls (PCA-align if not).
+#
+# debug: true  => per-stage trace to stdout + debug.json (every face kept/dropped + reason)
+# WARNING: yaml.safe_dump strips comments AND can drop keys on a bad round-trip. Keep THIS
+#          documented file as source of truth; edit values with sed/str_replace only.
+# =============================================================================
+
 tags:
   FLOOR: Main floor / ground plane
   CEILING: Ceiling / underside of roof
@@ -10,10 +34,7 @@ tags:
   STAGE: Stage deck / performance surface
   BALCONY_FACE: Vertical face of a balcony (reflector)
   STRUCTURE: Unclassified structural surface
-
-debug:true
-
-
+debug: true
 datum:
   use_fixed_datum: false
   floor_z: 0.0
