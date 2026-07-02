@@ -11,7 +11,8 @@ tags:
   BALCONY_FACE: Vertical face of a balcony (reflector)
   STRUCTURE: Unclassified structural surface
 
-debug: true
+debug:true
+
 
 datum:
   use_fixed_datum: false
@@ -30,6 +31,7 @@ pipeline:
   dbscan_min_points: 25
   simplify_tol_m: 0.1
   wall_strip_margin_m: 1.0
+  normal_split_cos: 0.85
 classify:
   vertical_cos: 0.995
   horizontal_cos: 0.2
@@ -47,6 +49,9 @@ classify:
   wall_perim_frac: 0.12
   min_wall_height_frac: 0.3
   min_arch_area_m2: 8.0
+  min_wall_length_frac: 0.25
+  wall_hist_bin_m: 0.1
+  wall_assoc_tol_m: 0.15
 downstream_layers:
   mapp3d: null
   arraycalc:

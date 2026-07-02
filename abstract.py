@@ -102,6 +102,85 @@ class StageLog:
             pass
 
 
+def detect_walls_hist(pts_all, band_z, band_tol, bounds, min_pp, eps, cfg, log=None):
+    """Find walls STATISTICALLY as peaks in the X and Y histograms — no normals.
+
+    A wall is SPARSE in 3D (few points relative to floor/ceiling) so RANSAC ranks it
+    below dense horizontal clutter and never reaches it. But a wall perpendicular to X
+    has ALL its points at nearly constant X: projected onto the X axis, every point at
+    every height collapses onto one bin -> a sharp PEAK, dense despite being sparse in 3D.
+    Same statistical principle as the z-histogram (floor/ceiling = peaks in Z):
+        floor/ceiling = peaks in Z    left/right walls = peaks in X    front/rear = peaks in Y
+    For each peak we RE-ASSOCIATE the full-cloud points at that coordinate (full height,
+    floor->ceiling) and validate wall-ness by z-span and perpendicular length.
+    Assumes axis-aligned walls (venues usually are; PCA-align first if not).
+    """
+    mn, mx = np.array(bounds[0]), np.array(bounds[1])
+    z = pts_all[:, 2]
+    floor_z, ceil_z = (band_z[0], band_z[-1]) if band_z else (float(z.min()), float(z.max()))
+    room_h = ceil_z - floor_z
+    # Strip ONLY floor & ceiling (the dense surfaces that dominate the X/Y baseline), with a
+    # tolerance scaled to room height so a short room isn't wiped out. Mid-level slabs are
+    # left in: a horizontal slab spreads uniformly across X/Y, so it can't fake a wall peak.
+    strip_tol = min(band_tol, max(0.3, room_h * 0.12))
+    keep = (np.abs(z - floor_z) > strip_tol) & (np.abs(z - ceil_z) > strip_tol)
+    mid = pts_all[keep]
+    if len(mid) < min_pp:                       # fallback: don't strip, higher baseline is ok
+        mid = pts_all
+        if log: log.info("wall-hist: strip left too few pts -> using full cloud")
+    min_wall_h = cfg["classify"].get("min_wall_height_frac", 0.3) * room_h
+    min_len_frac = cfg["classify"].get("min_wall_length_frac", 0.25)
+    bin_m = cfg["classify"].get("wall_hist_bin_m", 0.1)
+    tol = cfg["classify"].get("wall_assoc_tol_m", 0.15)
+
+    clusters = []
+    for axis in (0, 1):                       # 0=X -> left/right walls, 1=Y -> front/rear
+        span = 1 - axis
+        lo, hi = float(mn[axis]), float(mx[axis])
+        nb = max(10, int((hi - lo) / bin_m))
+        hist, edges = np.histogram(mid[:, axis], bins=nb, range=(lo, hi))
+        centers = (edges[:-1] + edges[1:]) / 2
+        nz = hist[hist > 0]
+        if len(nz) == 0:
+            continue
+        # a wall bin stands far above the (stripped) baseline
+        thr = max(hist.max() * 0.20, float(np.median(nz)) * 4)
+        above = hist >= thr
+        runs, i = [], 0
+        while i < len(hist):                  # merge contiguous bins into one peak
+            if above[i]:
+                j = i
+                while j < len(hist) and above[j]:
+                    j += 1
+                w = hist[i:j]; c = centers[i:j]
+                runs.append(float((c * w).sum() / w.sum()))
+                i = j
+            else:
+                i += 1
+        axname = "X" if axis == 0 else "Y"
+        if log: log.info(f"wall-hist {axname}: {len(runs)} peak(s) (thr={thr:.0f})")
+        for pos in runs:
+            wp = pts_all[np.abs(pts_all[:, axis] - pos) <= tol]   # re-associate FULL height
+            if len(wp) < min_pp:
+                continue
+            zspan = float(wp[:, 2].max() - wp[:, 2].min())
+            perp = float(wp[:, span].max() - wp[:, span].min())
+            perp_frac = perp / max(float(mx[span] - mn[span]), 1e-6)
+            if zspan >= min_wall_h and perp_frac >= min_len_frac:
+                kind = "WALL"
+            elif zspan >= min_wall_h:
+                kind = "column->STRUCTURE"
+            else:
+                kind = "skip (too short)"
+            if log:
+                log.info(f"  {axname}={pos:6.1f}  zspan={zspan:4.1f}m perp_frac={perp_frac:.2f} -> {kind}")
+            if kind.startswith("skip"):
+                continue
+            normal = np.zeros(3); normal[axis] = 1.0
+            clusters.append({"normal": normal, "pts": wp})
+    return clusters
+
+
 def staged_classify(raw, bounds, cfg, log=None):
     """
     Stage the WHOLE set of RANSAC planes, not each in isolation. Order:
@@ -372,74 +451,46 @@ def run(ply_path, tags_path, out_dir, voxel_override=None, debug=False):
                 models.append(np.array(model))
         return models
 
-    # ---- ROOT-CAUSE FIX: detect-stripped / fit-full ----
-    # 1) horizontal pass finds floor/ceiling z. 2) STRIP those z-bands and detect
-    # walls on the mid-height remainder (wall-dominated, no starvation). 3) each wall
-    # plane is RE-ASSOCIATED to the FULL cloud (points within ransac_dist of the plane)
-    # so the foot & top stripped for detection are reclaimed -> walls span floor..ceiling.
-    vcos = cfg["classify"]["vertical_cos"]
-    hcos = cfg["classify"]["horizontal_cos"]
+    # ---- FLOOR/CEILING via Z-HISTOGRAM (normal-free, robust) ----
+    # Per-point normals are too noisy to reliably route a complex/trussed ceiling into a
+    # horizontal pool. But the floor and ceiling are simply where points PILE UP in height
+    # -- the big peaks in the z-distribution. This uses only the measured z coordinate.
+    band_tol = cfg["classify"].get("band_tol_m", 1.0)
     strip_margin = P.get("wall_strip_margin_m", 1.0)
-    pn = np.abs(np.asarray(pcd.normals)[:, 2])
+    z = pts_all[:, 2]
+    lo, hi = float(z.min()), float(z.max())
+    nb = max(10, int((hi - lo) / 0.3))
+    hist, edges = np.histogram(z, bins=nb)
+    centers = (edges[:-1] + edges[1:]) / 2
+    thr = 0.08 * hist.max()                           # a "surface level" = >=8% of peak bin
+    zb = []
+    for c, h in zip(centers, hist):
+        if h < thr:
+            continue
+        if zb and c - zb[-1]["zmax"] <= 0.6:
+            zb[-1]["items"].append((c, h)); zb[-1]["zmax"] = c
+        else:
+            zb.append({"items": [(c, h)], "zmax": c})
+    band_z = sorted(sum(c * h for c, h in b["items"]) / sum(h for c, h in b["items"])
+                    for b in zb)
+    log.info(f"z-histogram surface levels: {[round(float(x), 1) for x in band_z]}")
 
-    # 1) horizontal detection (own budget) -> floor/ceiling heights + horiz clusters
-    pcd_h = pcd.select_by_index(np.where(pn >= vcos)[0])
-    horiz_clusters = _peel(pcd_h, P["max_planes"], "H")
-    floor_z = ceil_z = None
-    if horiz_clusters:
-        # Cluster horizontal planes into z-bands (fragmentation-robust), then take the
-        # lowest and highest bands with meaningful total point-mass as floor/ceiling.
-        # (A raw per-cluster size threshold fails when floor/ceiling shatter into many
-        # small coplanar fragments — each fragment is individually small.)
-        band_tol = cfg["classify"].get("band_tol_m", 1.0)
-        hc = sorted(horiz_clusters, key=lambda c: float(c["pts"][:, 2].mean()))
-        zbands = []
-        for c in hc:
-            zc = float(c["pts"][:, 2].mean()); npts = len(c["pts"])
-            if zbands and zc - zbands[-1]["z"] <= band_tol:
-                b = zbands[-1]
-                b["z"] = (b["z"] * b["n"] + zc * npts) / (b["n"] + npts)
-                b["n"] += npts
-            else:
-                zbands.append({"z": zc, "n": npts})
-        tot = sum(b["n"] for b in zbands)
-        big = [b for b in zbands if b["n"] >= 0.03 * tot]   # bands with real mass
-        if big:
-            floor_z, ceil_z = big[0]["z"], big[-1]["z"]
-            bands_str = ", ".join(f"{b['z']:.1f}m(n={b['n']})" for b in zbands)
-            log.info(f"z-bands: [{bands_str}]",
-                     floor_z=f"{floor_z:.1f}", ceil_z=f"{ceil_z:.1f}")
+    # horizontal clusters = points at each surface level (feeds FLOOR/CEILING/STRUCTURE)
+    horiz_clusters = []
+    for bz in band_z:
+        hp = pts_all[np.abs(z - bz) <= band_tol]
+        if len(hp) >= min_pp:
+            horiz_clusters.append({"normal": np.array([0, 0, 1.0]), "pts": hp})
+    floor_z = band_z[0] if band_z else None
+    ceil_z = band_z[-1] if band_z else None
 
-    # 2) + 3) z-strip detection then re-associate to full cloud
-    vert_clusters = []
-    if floor_z is not None and ceil_z is not None and (ceil_z - floor_z) > 2 * strip_margin:
-        z = pts_all[:, 2]
-        mid = np.where((z > floor_z + strip_margin) & (z < ceil_z - strip_margin))[0]
-        log.info(f"z-strip: floor_z={floor_z:.1f} ceil_z={ceil_z:.1f}  "
-                 f"{len(mid):,} mid-height pts for wall detection")
-        models = _peel_vmodels(pcd.select_by_index(mid), P["max_planes"])
-        log.info(f"detected {len(models)} vertical plane models -> re-associating full cloud")
-        for m in models:
-            nrm = m[:3] / (np.linalg.norm(m[:3]) or 1.0)
-            dist = np.abs(pts_all @ nrm + m[3] / (np.linalg.norm(m[:3]) or 1.0))
-            onp = pts_all[dist <= P["ransac_dist_m"]]        # FULL-height points on plane
-            if len(onp) < min_pp:
-                continue
-            opc = o3d.geometry.PointCloud()
-            opc.points = o3d.utility.Vector3dVector(onp)
-            labels = np.array(opc.cluster_dbscan(eps=eps, min_points=P["dbscan_min_points"]))
-            for lab in sorted(set(labels)):
-                if lab < 0:
-                    continue
-                cpts = onp[labels == lab]
-                if len(cpts) < min_pp:
-                    continue
-                vert_clusters.append({"normal": nrm, "pts": cpts})
-    else:
-        # fallback: no clear floor/ceiling -> peel verticals from non-horizontal pts
-        log.info("no clear floor/ceiling bands; vertical fallback peel")
-        vert_clusters = _peel(pcd.select_by_index(np.where(pn < vcos)[0]),
-                              P["max_planes"], "V")
+    # ---- WALLS via X/Y HISTOGRAMS (statistical, normal-free) ----
+    # RANSAC ranks planes by inlier count, so sparse walls always lose to dense horizontal
+    # clutter — even with a separate budget. Instead: walls perp to X are PEAKS in the X
+    # histogram, perp to Y are peaks in Y. Re-associate full-cloud points at each peak so
+    # walls span floor->ceiling. (Same idea as floor/ceiling = peaks in Z.)
+    vert_clusters = detect_walls_hist(pts_all, band_z, band_tol, bounds,
+                                      min_pp, eps, cfg, log=log)
 
     raw_clusters = horiz_clusters + vert_clusters
 
