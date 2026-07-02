@@ -41,7 +41,7 @@ def _voxel_np(pts, cols, voxel):
     return np.asarray(d.points), (np.asarray(d.colors) if cols is not None else None)
 
 
-def convert(src, dst, voxel=0.03, target_points=3_000_000,
+def convert(src, dst, voxel=0.03, target_points=None,
             block=5_000_000, with_color=True, scan_index=0, bounds=None):
     """
     bounds: optional (xmin, ymin, xmax, ymax) in the E57's GLOBAL frame. Points
@@ -58,7 +58,13 @@ def convert(src, dst, voxel=0.03, target_points=3_000_000,
     if has_color:
         use_fields += ["colorRed", "colorGreen", "colorBlue"]
 
-    # block-sized buffers (NOT full point_count) -> bounded memory
+    # block-sized buffers (NOT full point_count) -> bounded memory.
+    # NOTE: pye57.make_buffer() hardcodes color fields to uint8 (dtype 'B', 0-255). XGRIDS/
+    # LixelStudio E57s store 16-bit color (0-65535), so a uint8 buffer throws
+    # ErrorValueNotRepresentable on the first value >255 (e.g. colorRed=23644). We therefore
+    # build FLOAT64 buffers for ALL fields ourselves (doConversion=True, doScaling=True) so
+    # any color bit-depth is read losslessly. This is the recurring "16-bit color" fix --
+    # keep it committed; make_buffer will silently reintroduce the bug.
     buffers = libe57.VectorSourceDestBuffer()
     arrays = {}
     for f in use_fields:
@@ -122,11 +128,22 @@ def convert(src, dst, voxel=0.03, target_points=3_000_000,
     # final voxel pass to dedup chunk-boundary overlaps
     pts, cols = _voxel_np(pts, cols, voxel)
 
-    # if still above budget, coarsen on the (now small) cloud until under target
+    # OPTIONAL point-budget cap. OFF by default: an explicit --voxel is HONORED, never
+    # silently overridden. Only engages when --target-points is set, and WARNS loudly when
+    # it coarsens. (This cap once turned voxel 0.03 -> 0.1448 silently, thinning perimeter
+    # walls below histogram-detectability.) Read-time memory is bounded by block streaming
+    # and the every-10-blocks consolidation, NOT by this cap, so leaving it off is safe.
     v = voxel
-    while len(pts) > target_points:
-        v *= 1.3
-        pts, cols = _voxel_np(pts, cols, v)
+    if target_points is not None:
+        n_before = len(pts)
+        while len(pts) > target_points:
+            v *= 1.3
+            pts, cols = _voxel_np(pts, cols, v)
+        if round(v, 4) != round(voxel, 4):
+            print(f"  !! POINT-BUDGET CAP ENGAGED: voxel {voxel} m gave {n_before:,} pts "
+                  f"> target {target_points:,}")
+            print(f"     coarsened voxel {voxel} -> {round(v, 4)} m -> {len(pts):,} pts. "
+                  f"Raise/omit --target-points to keep {voxel} m.")
     final_voxel = round(v, 4)
 
     # recenter from global/registered origin to a local frame (metres from min corner)
@@ -164,7 +181,9 @@ if __name__ == "__main__":
     p2 = sub.add_parser("convert")
     p2.add_argument("src"); p2.add_argument("dst")
     p2.add_argument("--voxel", type=float, default=0.03)
-    p2.add_argument("--target-points", type=int, default=3_000_000)
+    p2.add_argument("--target-points", type=int, default=None,
+                    help="OPTIONAL output point cap. If set, may coarsen --voxel "
+                         "(warns loudly). Omit (default) to honor --voxel exactly.")
     p2.add_argument("--block", type=int, default=5_000_000)
     p2.add_argument("--bounds", type=str, default=None,
                     help="global XY crop: xmin,ymin,xmax,ymax")
